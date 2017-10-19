@@ -1,8 +1,10 @@
 #ifndef _INT_SET_H_
 #define _INT_SET_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 
 namespace internal {
 
@@ -93,6 +95,22 @@ inline int leading_zero_bits(unsigned long long n) {
 }
 #endif
 
+template <typename Key, typename Value, int Height> struct child_container {
+  using type = std::unordered_map<Key, Value>;
+};
+
+template <typename T, std::size_t Size> struct array_map {
+  using value_type = T;
+
+  auto &&operator[](auto i) { return items_[i]; }
+};
+
+template <typename Key, typename Value> struct child_container<Key, Value, 1> {
+  using type = std::array<Value, 4096>;
+};
+
+template <typename Key, typename Value> struct child_container<0>;
+
 } // namespace internal
 
 template <typename Int,
@@ -103,11 +121,154 @@ public:
   using value_type = Int;
   using size_type = std::size_t;
 
+  static const Int nval = std::numeric_limits<Int>::max();
+
   int_set() {}
 
-  const_iterator find(Int i) { return {}; }
+  struct const_iterator {};
+
+  bool empty() const { return size_ == 0; }
+
+  size_type size() const { TODO }
+
+  const_iterator find(Int n) {
+    if (!count(n)) {
+      return {};
+    }
+    return {*this, n};
+  }
+
+  const_iterator lower_bound(Int n) const { TODO }
+
+  const_iterator upper_bound(Int n) const { TODO }
+
+  Int front() const { return min_; }
+
+  Int back() const { return max_; }
+
+  Int min_greater_equal(Int n) const {
+    if (empty() || n > max_) {
+      return nval;
+    }
+    if (n <= min_) {
+      return min_;
+    }
+    const Int page_index = page(n);
+    const Int page_offset = offset(n);
+    auto it = children_.find(page_index);
+    if (it == children_.end() || page_offset > it->second.back()) {
+      const Int next_page = nonempty_.min_greater_equal(page_index + 1);
+      return from_page_offset(next_page, children_.find(next_page).front());
+    }
+    return from_page_offset(page_index,
+                            it->second.min_greater_equal(page_offset));
+  }
+
+  Int max_less_than(Int n) const {
+    if (empty() || n <= min_) {
+      return nval;
+    }
+    if (n > max_) {
+      return max_;
+    }
+    const Int page_index = page(n);
+    const Int page_offset = offset(n);
+    auto it = children_.find(page_index);
+    if (it == children_.end() || page_offset <= it->second.front()) {
+      const Int prev_page = nonempty_.max_less_than(page_index);
+      return from_page_offset(prev_page, children_.find(prev_page).back());
+    }
+    return from_page_offset(page_index, it->second.max_less_than(page_offset));
+  }
+
+  std::pair<const_iterator, bool> insert(Int n) {
+    assert(n < nval);
+    if (empty()) {
+      min_ = max_ = n;
+      size_ = 1;
+      return;
+    }
+    if (n < min_) {
+      // min <= max, so n != max.
+      std::swap(n, min_);
+      ++size_;
+    } else if (n > max_) {
+      // min <= max, so n != min.
+      std::swap(n, max_);
+      ++size_;
+    }
+    TODO - update size_ in all cases below;
+    const Int page_index = page(n);
+    auto &child = children_[page_index];
+    if (child.empty()) {
+      // if the child node that stores this element is currently empty, then
+      // the insert below will be O(1), so we can afford to recurse on the
+      // nonempty set.
+      nonempty_.insert(page_index);
+    }
+    child.insert(offset(n));
+  }
+
+  auto emplace(Int n) { return insert(n); }
+
+  size_type erase(Int n) {
+    if (!count(n)) {
+      return 0;
+    }
+    TODO - implement, updating size_
+  }
+
+  const_iterator begin() const { return cbegin(); }
+
+  const_iterator begin() const { return cend(); }
+
+  const_iterator cbegin() const { return lower_bound(0); }
+
+  const_iterator cend() const { return {}; }
+
+  size_type count(Int n) const {
+    if (empty()) {
+      return 0;
+    }
+    if (n < min_ || n > max_) {
+      return 0;
+    }
+    if (n == min_ || n == max_) {
+      return 1;
+    }
+    const Int page_index = page(n);
+    if (nonempty_.count(page_index)) {
+      return children_.find(page_index)->second.count(offset(n));
+    }
+    return 0;
+  }
+
+  bool operator[](size_type i) const { return count(i); }
 
 private:
+  // Tree:
+  // 0:  64 64 64 ... 64 64 64 ...
+  // 1:  4096         4096        ...
+  // 2:  16.7M                        ...
+  // 3:  2^48
+  // 4:  2^96 > 64
+  //
+  using child_type = int_set<Int, MaxSizeLog64Log2 - 1>;
+
+  using child_container =
+      internal::child_continer<Int, child_type, MaxSizeLog64Log2 - 1>::type;
+
+  Int page(Int n) { TODO }
+  Int offset(Int n) { TODO }
+
+  Int size_ = 0;
+  Int min_, max_;
+
+  // The set of non-empty child sets by page index.  Size is n^0.5
+  child_type nonempty_;
+
+  // A collection of n^0.5 sets each of size n^0.5
+  child_container children_;
 };
 
 // Non-recursive case; use builtins (clz, ctz) if available and 64-bit bit map.
@@ -167,6 +328,10 @@ public:
     return const_iterator(*this, min_greater_equal(n + 1));
   }
 
+  Int front() const { return min_greater_equal(0); }
+
+  Int back() const { return 64 - internal::leading_zero_bits(bitmap_); }
+
   Int min_greater_equal(Int n) const {
     const Int c = internal::trailing_zero_bits(bitmap_ & greater_equal_mask(n));
     return c ? c : 64;
@@ -205,7 +370,7 @@ public:
 
 private:
   static Int bit_mask(const Int n) __attribute__((always_inline)) {
-    return 1 << n;
+    return Int{1} << n;
   }
 
   static Int less_than_mask(const Int n) __attribute__((always_inline)) {
